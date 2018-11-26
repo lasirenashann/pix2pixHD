@@ -17,9 +17,16 @@ class Pix2PixHDModel(BaseModel):
         def loss_filter(g_gan, g_gan_feat, g_vgg, d_real, d_fake):
             return [l for (l,f) in zip((g_gan,g_gan_feat,g_vgg,d_real,d_fake),flags) if f]
         return loss_filter
-    
+
+    def reset_(self):
+        self.last_label = None
+        self.last_real_image = None
+        self.last_fake_image = None
+
     def initialize(self, opt):
         BaseModel.initialize(self, opt)
+        self.reset_()
+        
         if opt.resize_or_crop != 'none' or not opt.isTrain: # when training at full res this causes OOM
             torch.backends.cudnn.benchmark = True
         self.isTrain = opt.isTrain
@@ -41,7 +48,7 @@ class Pix2PixHDModel(BaseModel):
         # Discriminator network
         if self.isTrain:
             use_sigmoid = opt.no_lsgan
-            netD_input_nc = input_nc + opt.output_nc
+            netD_input_nc = (input_nc + opt.output_nc) * 2
             if not opt.no_instance:
                 netD_input_nc += 1
             self.netD = networks.define_D(netD_input_nc, opt.ndf, opt.n_layers_D, opt.norm, use_sigmoid, 
@@ -143,8 +150,8 @@ class Pix2PixHDModel(BaseModel):
 
         return input_label, inst_map, real_image, feat_map
 
-    def discriminate(self, input_label, test_image, use_pool=False):
-        input_concat = torch.cat((input_label, test_image.detach()), dim=1)
+    def discriminate(self, input_label, last_input_label, test_image, last_test_image, use_pool=False):
+        input_concat = torch.cat((input_label, last_input_label, test_image.detach(), last_test_image), dim=1)
         if use_pool:            
             fake_query = self.fake_pool.query(input_concat)
             return self.netD.forward(fake_query)
@@ -154,6 +161,14 @@ class Pix2PixHDModel(BaseModel):
     def forward(self, label, inst, image, feat, infer=False):
         # Encode Inputs
         input_label, inst_map, real_image, feat_map = self.encode_input(label, inst, image, feat)  
+
+        # Initialize to zeros for timestep 0
+        if self.last_label is None:
+            self.last_label = torch.zeros(input_label.size()).cuda()
+        if self.last_real_image is None:
+            self.last_real_image = torch.zeros(real_image.size()).cuda()
+        if self.last_fake_image is None:
+            self.last_fake_image = torch.zeros(real_image.size()).cuda()
 
         # Fake Generation
         if self.use_features:
@@ -165,15 +180,15 @@ class Pix2PixHDModel(BaseModel):
         fake_image = self.netG.forward(input_concat)
 
         # Fake Detection and Loss
-        pred_fake_pool = self.discriminate(input_label, fake_image, use_pool=True)
+        pred_fake_pool = self.discriminate(input_label, self.last_label, fake_image, self.last_fake_image, use_pool=True)
         loss_D_fake = self.criterionGAN(pred_fake_pool, False)        
 
         # Real Detection and Loss        
-        pred_real = self.discriminate(input_label, real_image)
+        pred_real = self.discriminate(input_label, self.last_label, real_image, self.last_real_image)
         loss_D_real = self.criterionGAN(pred_real, True)
 
         # GAN loss (Fake Passability Loss)        
-        pred_fake = self.netD.forward(torch.cat((input_label, fake_image), dim=1))        
+        pred_fake = self.netD.forward(torch.cat((input_label, self.last_label, fake_image, self.last_fake_image), dim=1))        
         loss_G_GAN = self.criterionGAN(pred_fake, True)               
         
         # GAN feature matching loss
@@ -191,6 +206,11 @@ class Pix2PixHDModel(BaseModel):
         if not self.opt.no_vgg_loss:
             loss_G_VGG = self.criterionVGG(fake_image, real_image) * self.opt.lambda_feat
         
+        # Memorize for the next timestep
+        self.last_label = input_label
+        self.last_real_image = real_image
+        self.last_fake_image = fake_image.detach() # stop gradient
+
         # Only return the fake_B image if necessary to save BW
         return [ self.loss_filter( loss_G_GAN, loss_G_GAN_Feat, loss_G_VGG, loss_D_real, loss_D_fake ), None if not infer else fake_image ]
 
